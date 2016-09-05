@@ -112,6 +112,8 @@ Usage: omxplayer [OPTIONS] [FILE]
         --user-agent 'ua'       Send specified User-Agent as part of HTTP requests
         --lavfdopts 'opts'      Options passed to libavformat, e.g. 'probesize:250000,...'
         --avdict 'opts'         Options passed to demuxer, e.g., 'rtsp_transport:tcp,...'
+        --txsyncclk name,addr,port   Transmit the playback clock
+        --rxsyncclk name,port,offset Sync to received playback clock
 
 For example:
 

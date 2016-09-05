@@ -26,6 +26,9 @@
 #include <sys/ioctl.h>
 #include <getopt.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 
 #define AV_NOWARN_DEPRECATED
 
@@ -522,6 +525,12 @@ int main(int argc, char *argv[])
   int m_orientation      = -1; // unset
   float m_fps            = 0.0f; // unset
   TV_DISPLAY_STATE_T   tv_state;
+  char          SyncClockName[64];   // the name of the clock to send or discriminate for
+  std::string   BcstAddress;  // the network broadcast address, TX mode
+  int           SyncOffsetMicroSeconds = 0.0;  // an offset to apply to clock data received
+  int           ExtSync = 0;   // 0 if sync not enabled, 1 if TX sync, 2 if RX sync
+  int           SyncSocketFD, UDPPort;  // file-desc# for network port, and UDP port number
+  struct sockaddr_in    SyncSocket;  // address for the network port
   double last_seek_pos = 0;
   bool idle = false;
   std::string            m_cookie              = "";
@@ -614,6 +623,8 @@ int main(int argc, char *argv[])
     { "threshold",    required_argument,  NULL,          threshold_opt },
     { "timeout",      required_argument,  NULL,          timeout_opt },
     { "boost-on-downmix", no_argument,    NULL,          boost_on_downmix_opt },
+    { "txsyncclk",    required_argument,  NULL,          txsyncclk_opt },
+    { "rxsyncclk",    required_argument,  NULL,          rxsyncclk_opt },
     { "no-boost-on-downmix", no_argument, NULL,          no_boost_on_downmix_opt },
     { "key-config",   required_argument,  NULL,          key_config_opt },
     { "no-osd",       no_argument,        NULL,          no_osd_opt },
@@ -922,6 +933,20 @@ int main(int argc, char *argv[])
       case ':':
         return EXIT_FAILURE;
         break;
+      case txsyncclk_opt:
+        sscanf(optarg, "%s %s %d", &SyncClockName, &BcstAddress, &UDPPort);
+        ExtSync = 1;  // store the sync mode
+        //TODO
+        // verify unpacking of the clock name, broadcast address, and UDP port number above
+        break;
+      case rxsyncclk_opt:
+        sscanf(optarg, "%s %d %f", &SyncClockName, &UDPPort, &SyncOffset);
+        ExtSync = 2;  // store the sync mode
+        //TODO
+        // verify unpacking of the clock name, UDP port number, and offset above
+        // the SyncOffset may need to be massaged to the signed integer of microseconds
+        // as described above
+        break;
       default:
         return EXIT_FAILURE;
         break;
@@ -1170,6 +1195,34 @@ int main(int argc, char *argv[])
 
   if (m_threshold < 0.0f)
     m_threshold = m_config_audio.is_live ? 0.7f : 0.2f;
+  if(ExtSync){
+    //Create the socket and fault/exit out if it can't be done
+    if ((SyncSocket = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+      printf("Cannot create sync socket\n");
+      goto do_exit;
+    }
+
+    //Might as well bind the TX/sender to the same port as everyone else,
+    //We'll just ignore all data that comes in
+    memset((char *)&SyncSocket, 0, sizeof(SyncSocket));
+    SyncSocket.sin_family = AF_INET;
+    SyncSocket.sin_addr.s_addr = htonl(INADDR_ANY);
+    SyncSocket.sin_port = htons(UDPPort);
+
+    int SocketEnable = 1;
+    //Enable broadcasting, most Linux/Posix requires that it's specifically
+    int ret = setsockopt(SyncSocketFD, SOL_SOCKET, SO_BROADCAST, &SocketEnable, sizeof(SocketEnable));
+    //Enable reuse of the port so others can bind to it too,
+    //there will probably be other processes listening to this port on the
+    //same machines, as the control software designed by the original
+    //idea man for this has multiple programs listening on the same port
+    int ret = setsockopt(SyncSocketFD, SOL_SOCKET, SO_REUSEPORT, &SocketEnable, sizeof(SocketEnable));
+
+    if (bind(SyncSocketFD, (struct sockaddr *)&SyncSocket, sizeof(SyncSocket)) < 0) {
+      printf("Bind to sync port failed");
+      goto do_exit;
+    }
+  }
 
   PrintSubtitleInfo();
 
@@ -1864,6 +1917,10 @@ do_exit:
 
   g_OMX.Deinitialize();
   g_RBP.Deinitialize();
+
+  if(SyncSocketFD) {
+    close(SyncSocketFD);
+  }
 
   printf("have a nice day ;)\n");
 
