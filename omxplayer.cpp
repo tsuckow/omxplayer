@@ -1692,6 +1692,169 @@ int main(int argc, char *argv[])
                audio_fifo, m_player_audio.GetDelay(), m_player_audio.GetCacheTotal(),
                m_player_video.GetCached()>>10, m_player_audio.GetCached()>>10);
       }
+      
+      char SyncBuffer[2048];  // somewhere to stash incoming UDP packets
+      char *SyncBufPtr;
+      const char SyncKW = 'clock ';  // a keyword to scan for in the packets
+      size_t SyncBufferLen;
+      ssize_t SyncBufferResult;
+      int SyncRXFlags, SyncRXLen, SyncCurSpeed = 0;
+      struct sockaddr SyncAddr;
+      static int SyncCount;
+      unsigned long long SyncCurTime;
+      
+      //! this tests for the mode we're in
+      if((ExtSync == 1) {        // LHSG sync code for TX
+        
+        //! need to clean out the incoming network socket, but ignore anything in there
+        while ((SyncBufferResult = recvfrom(SyncSocketFD, *SyncBuffer, 2048)) != 0){}
+        
+        //! Throttle the packet transmission, aiming for about once a second.
+        //! Based on the 'stats' section, this should hopefully be close.
+        if (count & 63 == 0)) {
+        
+          //! store the current time in a variable
+          SyncCurTime = m_av_clock->OMXMediaTime();   // get the current time
+          //! create/initial the buffer for the text packet to send
+          //! put the text 'clock ' into the buffer
+          //! put the name of the clock (passed on the command line) into the buffer
+          //! add another space
+          //! massage the current time variable into a text decimal number, then into the buffer
+          //! put the new-line character into the buffer
+          //! the final string should look something like this:
+            //! "clock videoplay1 90.154\n"
+            //! in the above example, "videoplay1" is the name of the clock
+            //! and the time is 0:01:30.154
+
+          /*
+          SyncBufferLen = 0;           // buffer back to zero length
+          SyncBufPtr = &SyncBuffer;    // buffer pointer to the top address
+          strcpy(SyncBufPtr, *SyncKW, sizeof(SyncKW));   // copy "clock " keyword into packet
+          strcpy(SyncBufPtr, *SyncClockName, SyncClkNameLen);  // copy clock name
+          &SyncBufPtr = ' '; SyncBufPtr++;  // append a space
+          */
+          
+          //! send the buffer to the broadcast address and specified port number
+          sendto(SyncSocketFD, *SyncBuffer, (SyncBufPtr - *SyncBuffer), 0, *BcstAddress, BcstAddressLen)
+
+      }}
+            
+      if(ExtSync == 2) {        // LHSG sync code for RX, look for new packets
+        if ((SyncRXLen = recvfrom(SyncSocketFD, *SyncBuffer, 2048) > 0)) {
+        
+          //! While there are packets to be received, we will keep receiving them
+          //! and looking for clock data.  Any clock value we receive after another
+          //! one will over-write the previous value. i.e. will keep the last one we received.
+          
+          //! For compatibility with another system, any line that does not have
+          //! the key word "clock" at the beginning of it will be ignored, and we
+          //! will continue thru the packet looking for lines after each new-line
+          //! character.  i.e. There may be clock data on later lines in the packet.
+          //! But, as soon as clock data is found in a packet, there will not be
+          //! more clock data for the same clock name in that packet.
+          //! more clock data for the same clock name in that packet.  Also, in the
+          //! LHSG software, if the first 5 characters of a packet are 'file ', then
+          //! the rest of the packet is binary data.  If that is detected, then the
+          //! packet can be immediately discarded.
+          
+          //! Pythonic pseudo-code:
+          // received_time_index = None
+          // for packet in udp_port.recvfrom():
+            // if packet[:5] == 'file ':
+              // continue
+            // for line in packet.readlines():
+              // if line[:6] != 'clock ':
+                // continue
+              // if line.split(' ', 2)[1] != stored_clock_name:
+                // continue
+              // received_time_index = int(line.split(' ', 2)[2] * 1000000)
+              // break
+          
+          //! If we received an update, we now need to quickly snapshot the
+          //! difference between the recieved clock and this player, along with
+          //! when the snapeshot took place
+          // if received_time_index:
+            //! store the time we received it, based on the current player position
+            // time_of_reception = m_av_clock->OMXMediaTime()
+            //! we now store the offset between the player and the received clock,
+            //! while considering the added offset from the command line
+            // current_offset = received_time_index - time_of_reception - offset_from_command_line
+            //! positive means we're ahead, negative means we're behind
+            
+          //! if our current offset is large... say over 2 seconds, we just jump the
+          //! player to the correct position and set its playback speed to normal
+          // if abs(current_offset) > 2:
+            // if the_player_can_seek():   # m_omx_reader.CanSeek()
+              // seek_amount = -current_offset       # m_incr = 600.0;
+              // player_to_normal_speed()
+              // SyncCurSpeed = 0  # noting the above action for just below
+            //! if we can't seek, pause the player if we're ahead
+            // elif current_offset > 0:
+              // pause_the_player()
+              // SyncCurSpeed = -1   # note this as slow speed for the following process
+            //! or speed it up if we're behind
+            // else:
+              // player_to_fast_speed()
+              // SyncCurSpeed = 1
+          
+          }
+        
+        if(SyncCurSpeed != 0) {
+        //! If the current speed is not normal, then we are converging to sync.
+        //! We do this every time around the loop, even when no packets are
+        //! received.  We will dead-reckon the time that the master player should
+        //! be at.
+          
+          //! grab the player position at this moment
+          // right_now = m_av_clock->OMXMediaTime()  # the current player position
+          //! find the time past since the last "time_of_reception" (which may be dead reckoned)
+          // delta_time = right_now - time_of_reception
+          //! If the player is going fast, then the offset time will move in the positive
+          //! direction based on the delta_time, negative direction if the player is
+          //! going slower.
+          // if SyncCurSpeed == 1:
+            // current_offset += int(delta_time * (1.125 - 1))
+          //! SyncCurSpeed is -1 because it's [-1,0,1], thus can only be that at this point
+          // elif the_player_can_seek():
+            // current offset -= int(delta_time * (1 - 0.975))
+          // else:
+            // current offset -= delta_time  # player would be paused if it can't seek
+          //! Store the "time_of_reception" as being the "right_now" time because
+          //! we adjusted the "current_offset", thus dead reckoning where the master
+          //! should be right now.  It will be overwritten if we do receive a packet
+          //! next time around.
+          // time_of_reception = right_now
+          
+          //! now we need to decide if to return to normal speed
+          //! if the speed is fast, but the offset is nearly positive, then drop to normal speed
+          // if (current_offset > -0.01) and (SyncCurSpeed == 1):
+            // player_to_normal_speed()
+            // SyncCurSpeed == 0
+          //! if the speed is low (or paused) and the offset is nearly negative...
+          // if (current_offset < 0.01) and (SyncCurSpeed == -1):
+            // if the_player_can_seek():
+              // player_to_normal_speed()
+            // else:
+              // unpause_the_player()
+            // SyncCurSpeed == 0
+          
+        } else {
+        //! If the current speed is normal, then we need to decide whether to change
+        //! the speed based on the current_offset.
+          // if (current_offset < -0.05):  # will need to experiment for this threshhold
+            // player_to_fast_speed()
+            // SyncCurSpeed = 1
+          // if the_player_can_seek():
+            // if (current_offset > 0.05):
+              // player_to_slow_speed()
+              // SyncCurSpeed = -1
+          // else:
+            //! if the player cannot seek, then the only way we have to adjust it is pausing it
+            // if (current_offset > 0.2):
+              // pause_the_player()
+              // SyncCurSpeed = -1
+        }
+      }
 
       if(m_tv_show_info)
       {
