@@ -8,6 +8,6 @@ COPY . /usr/src/omxplayer
 
 RUN ./prepare-native-raspbian.sh
 
-RUN make ffmpeg
-RUN make
-RUN make install
+RUN make ffmpeg -j3
+RUN make -j3
+RUN make dist
