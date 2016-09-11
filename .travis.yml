@@ -7,7 +7,6 @@ services:
 
 before_install:
 - docker pull codingwell/rpi-raspbian-omxplayer-ffmpeg
-- docker run --rm --privileged multiarch/qemu-user-static:register --reset
 
 script:
 - docker build -t rpi-omxplayer .
