@@ -527,7 +527,7 @@ int main(int argc, char *argv[])
   TV_DISPLAY_STATE_T   tv_state;
   char          SyncClockName[64];   // the name of the clock to send or discriminate for
   std::string   BcstAddress;  // the network broadcast address, TX mode
-  int           SyncOffsetMicroSeconds = 0.0;  // an offset to apply to clock data received
+  int           SyncOffsetMicroseconds = 0.0;  // an offset to apply to clock data received
   int           ExtSync = 0;   // 0 if sync not enabled, 1 if TX sync, 2 if RX sync
   int           SyncSocketFD, UDPPort;  // file-desc# for network port, and UDP port number
   struct sockaddr_in    SyncSocket;  // address for the network port
@@ -940,7 +940,7 @@ int main(int argc, char *argv[])
         // verify unpacking of the clock name, broadcast address, and UDP port number above
         break;
       case rxsyncclk_opt:
-        sscanf(optarg, "%s %d %f", &SyncClockName, &UDPPort, &SyncOffset);
+        sscanf(optarg, "%s %d %d", &SyncClockName, &UDPPort, &SyncOffsetMicroseconds);
         ExtSync = 2;  // store the sync mode
         //TODO
         // verify unpacking of the clock name, UDP port number, and offset above
