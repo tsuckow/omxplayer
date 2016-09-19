@@ -10,6 +10,9 @@ RUN ./prepare-native-raspbian.sh
 
 RUN mv /usr/src/ffmpeg_compiled /usr/src/omxplayer/ffmpeg_compiled
 
+#Documentation doesn't build right
+RUN touch omxplayer.1
+
 RUN make -j3
 RUN make dist
 
