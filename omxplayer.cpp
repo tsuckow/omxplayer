@@ -26,9 +26,14 @@
 #include <sys/ioctl.h>
 #include <getopt.h>
 #include <string.h>
+#include <sstream>
+#include <iomanip>
+#include <list>
+#include <chrono>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netdb.h>
 
 #define AV_NOWARN_DEPRECATED
 
@@ -525,12 +530,13 @@ int main(int argc, char *argv[])
   int m_orientation      = -1; // unset
   float m_fps            = 0.0f; // unset
   TV_DISPLAY_STATE_T   tv_state;
-  char          SyncClockName[64];   // the name of the clock to send or discriminate for
-  std::string   BcstAddress;  // the network broadcast address, TX mode
-  int           SyncOffsetMicroseconds = 0.0;  // an offset to apply to clock data received
+  std::string   sync_clock_name;   // the name of the clock to send or discriminate for
+  struct addrinfo * sync_socket_address;  // the network broadcast address, TX mode
+  std::list< std::pair<double,double> > sync_history;
+  double SyncOffsetMilliseconds = 0.0;  // an offset to apply to clock data received
   int           ExtSync = 0;   // 0 if sync not enabled, 1 if TX sync, 2 if RX sync
   int           SyncSocketFD, UDPPort;  // file-desc# for network port, and UDP port number
-  struct sockaddr_in    SyncSocket;  // address for the network port
+  struct sockaddr SyncSocket;  // address for the network port
   double last_seek_pos = 0;
   bool idle = false;
   std::string            m_cookie              = "";
@@ -554,6 +560,8 @@ int main(int argc, char *argv[])
   const int no_deinterlace_opt = 0x10b;
   const int threshold_opt   = 0x10c;
   const int timeout_opt     = 0x10f;
+  const int txsyncclk_opt   = 0x111;
+  const int rxsyncclk_opt   = 0x112; 
   const int boost_on_downmix_opt = 0x200;
   const int no_boost_on_downmix_opt = 0x207;
   const int key_config_opt  = 0x10d;
@@ -622,9 +630,9 @@ int main(int argc, char *argv[])
     { "video_queue",  required_argument,  NULL,          video_queue_opt },
     { "threshold",    required_argument,  NULL,          threshold_opt },
     { "timeout",      required_argument,  NULL,          timeout_opt },
-    { "boost-on-downmix", no_argument,    NULL,          boost_on_downmix_opt },
     { "txsyncclk",    required_argument,  NULL,          txsyncclk_opt },
     { "rxsyncclk",    required_argument,  NULL,          rxsyncclk_opt },
+    { "boost-on-downmix", no_argument,    NULL,          boost_on_downmix_opt },
     { "no-boost-on-downmix", no_argument, NULL,          no_boost_on_downmix_opt },
     { "key-config",   required_argument,  NULL,          key_config_opt },
     { "no-osd",       no_argument,        NULL,          no_osd_opt },
@@ -934,14 +942,54 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
         break;
       case txsyncclk_opt:
-        sscanf(optarg, "%s %s %d", &SyncClockName, &BcstAddress, &UDPPort);
-        ExtSync = 1;  // store the sync mode
+        {
+          std::string optstring(optarg);
+          std::replace( optstring.begin(), optstring.end(), ',', ' ');
+          std::stringstream istream(optstring);
+          std::string address;
+          std::string port;
+          istream >> sync_clock_name >> address >> port;
+          
+          std::cerr << "Parsed: " << sync_clock_name << "," << address << "," << port << std::endl;
+          
+          struct addrinfo hints;
+          memset(&hints, 0, sizeof(struct addrinfo));
+          hints.ai_family = AF_UNSPEC;    /* Allow IPv4 or IPv6 */
+          hints.ai_socktype = SOCK_DGRAM; /* Datagram socket */
+          hints.ai_flags = AI_PASSIVE;    /* For wildcard IP address */
+          hints.ai_protocol = 0;          /* Any protocol */
+
+          if(getaddrinfo(address.c_str(), port.c_str(), &hints, &sync_socket_address)) {
+            std::cerr << "Failed to get addrinfo" << std::endl;
+          }
+          ExtSync = 1;  // store the sync mode
+          //FIXME: Warn if already sync enabled
+        }
         //TODO
         // verify unpacking of the clock name, broadcast address, and UDP port number above
         break;
       case rxsyncclk_opt:
-        sscanf(optarg, "%s %d %d", &SyncClockName, &UDPPort, &SyncOffsetMicroseconds);
-        ExtSync = 2;  // store the sync mode
+        {
+          std::string optstring(optarg);
+          std::replace( optstring.begin(), optstring.end(), ',', ' ');
+          std::stringstream istream(optstring);
+          std::string address;
+          std::string port;
+          istream >> sync_clock_name >> address >> port >> SyncOffsetMilliseconds;
+          
+          std::cerr << "OF: " << SyncOffsetMilliseconds << std::endl;
+          
+          struct addrinfo hints;
+          memset(&hints, 0, sizeof(struct addrinfo));
+          hints.ai_family = AF_UNSPEC;    /* Allow IPv4 or IPv6 */
+          hints.ai_socktype = SOCK_DGRAM; /* Datagram socket */
+          hints.ai_flags = AI_PASSIVE;    /* For wildcard IP address */
+          hints.ai_protocol = 0;          /* Any protocol */
+          
+          getaddrinfo(address.c_str(), port.c_str(), &hints, &sync_socket_address);
+          ExtSync = 2;  // store the sync mode
+          //FIXME: Warn if already sync enabled
+        }
         //TODO
         // verify unpacking of the clock name, UDP port number, and offset above
         // the SyncOffset may need to be massaged to the signed integer of microseconds
@@ -1195,32 +1243,55 @@ int main(int argc, char *argv[])
 
   if (m_threshold < 0.0f)
     m_threshold = m_config_audio.is_live ? 0.7f : 0.2f;
-  if(ExtSync){
+  if (ExtSync){
     //Create the socket and fault/exit out if it can't be done
-    if ((SyncSocket = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+    if ((SyncSocketFD = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
       printf("Cannot create sync socket\n");
       goto do_exit;
     }
-
+/*
     //Might as well bind the TX/sender to the same port as everyone else,
     //We'll just ignore all data that comes in
-    memset((char *)&SyncSocket, 0, sizeof(SyncSocket));
+    memset((void *)&SyncSocket, 0, sizeof(SyncSocket));
     SyncSocket.sin_family = AF_INET;
     SyncSocket.sin_addr.s_addr = htonl(INADDR_ANY);
     SyncSocket.sin_port = htons(UDPPort);
-
+ */
     int SocketEnable = 1;
     //Enable broadcasting, most Linux/Posix requires that it's specifically
-    int ret = setsockopt(SyncSocketFD, SOL_SOCKET, SO_BROADCAST, &SocketEnable, sizeof(SocketEnable));
+    if (setsockopt(SyncSocketFD, SOL_SOCKET, SO_BROADCAST, &SocketEnable, sizeof(SocketEnable))) {
+      printf("Sync socket set broadcast failed\n");
+      goto do_exit;
+    }
     //Enable reuse of the port so others can bind to it too,
     //there will probably be other processes listening to this port on the
     //same machines, as the control software designed by the original
     //idea man for this has multiple programs listening on the same port
-    int ret = setsockopt(SyncSocketFD, SOL_SOCKET, SO_REUSEPORT, &SocketEnable, sizeof(SocketEnable));
-
-    if (bind(SyncSocketFD, (struct sockaddr *)&SyncSocket, sizeof(SyncSocket)) < 0) {
-      printf("Bind to sync port failed");
+    if (setsockopt(SyncSocketFD, SOL_SOCKET, SO_REUSEPORT, &SocketEnable, sizeof(SocketEnable))) {
+      printf("Sync socket set reuse failed\n");
       goto do_exit;
+    }
+    
+    
+    //FIXME: Get away from blocking reads
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 10000;
+    if (setsockopt(SyncSocketFD, SOL_SOCKET, SO_RCVTIMEO,&tv,sizeof(tv)) < 0) {
+      printf("Sync socket set receive timeout failed\n");
+      goto do_exit;
+    }
+    
+    int priority=6; // 1- low priority, 7 - high priority  
+    if (setsockopt(SyncSocketFD, SOL_SOCKET, SO_PRIORITY, &priority, sizeof(priority)) < 0) {
+      printf("Sync socket set priority failed. %s\n",  strerror( errno ));
+    }
+    
+    if(ExtSync == 2) {
+      if (bind(SyncSocketFD, sync_socket_address->ai_addr, sync_socket_address->ai_addrlen) < 0) {
+        printf("Bind to sync port failed\n");
+        goto do_exit;
+      }
     }
   }
 
@@ -1598,7 +1669,7 @@ int main(int argc, char *argv[])
         last_seek_pos = seek_pos;
 
         seek_pos *= 1000.0;
-
+          
         if(m_omx_reader.SeekTime((int)seek_pos, m_incr < 0.0f, &startpts))
         {
           unsigned t = (unsigned)(startpts*1e-6);
@@ -1693,28 +1764,27 @@ int main(int argc, char *argv[])
                m_player_video.GetCached()>>10, m_player_audio.GetCached()>>10);
       }
       
-      char SyncBuffer[2048];  // somewhere to stash incoming UDP packets
+      
       char *SyncBufPtr;
-      const char SyncKW = 'clock ';  // a keyword to scan for in the packets
+      const char * SyncKW = "clock ";  // a keyword to scan for in the packets
       size_t SyncBufferLen;
       ssize_t SyncBufferResult;
-      int SyncRXFlags, SyncRXLen, SyncCurSpeed = 0;
+      int SyncRXFlags, SyncCurSpeed = 0;
       struct sockaddr SyncAddr;
       static int SyncCount;
-      unsigned long long SyncCurTime;
-      
       //! this tests for the mode we're in
-      if((ExtSync == 1) {        // LHSG sync code for TX
-        
+      if(ExtSync == 1) {        // LHSG sync code for TX
+        static int count;
         //! need to clean out the incoming network socket, but ignore anything in there
-        while ((SyncBufferResult = recvfrom(SyncSocketFD, *SyncBuffer, 2048)) != 0){}
+        //while ((SyncBufferResult = recv(SyncSocketFD, SyncBuffer, 2048, 0/*flags*/)) != 0){}
         
         //! Throttle the packet transmission, aiming for about once a second.
         //! Based on the 'stats' section, this should hopefully be close.
-        if (count & 63 == 0)) {
+        if ((count++ % 1) == 0) {
         
           //! store the current time in a variable
-          SyncCurTime = m_av_clock->OMXMediaTime();   // get the current time
+          double const media_time = m_av_clock->OMXMediaTime() *1e-6;   // get the current time
+          
           //! create/initial the buffer for the text packet to send
           //! put the text 'clock ' into the buffer
           //! put the name of the clock (passed on the command line) into the buffer
@@ -1735,13 +1805,79 @@ int main(int argc, char *argv[])
           */
           
           //! send the buffer to the broadcast address and specified port number
-          sendto(SyncSocketFD, *SyncBuffer, (SyncBufPtr - *SyncBuffer), 0, *BcstAddress, BcstAddressLen)
-
-      }}
+          //FIXME: 
+          std::stringstream buffer("clock ");
+          static double lastnow = 0;
+          static long sequence = 0;
+          buffer << std::fixed << std::setprecision(6);
+          buffer << sync_clock_name << " " << media_time << " " << now << " " << (now - lastnow) << " " << sequence++ << '\n';
+          lastnow = now;
+          std::string bufferstr = buffer.str();
+          if (((count-1) % 240) == 0) {
+            std::cerr << "Send Sync Packet: " << bufferstr << std::endl;
+          }
+          ssize_t sent_bytes = sendto(SyncSocketFD, bufferstr.c_str(), bufferstr.size(), 0, sync_socket_address->ai_addr, sync_socket_address->ai_addrlen);
+          if (sent_bytes < 0) {
+            std::cerr << "Cannot send sync packet" << std::endl;
+          }
+        }
+      }
             
       if(ExtSync == 2) {        // LHSG sync code for RX, look for new packets
-        if ((SyncRXLen = recvfrom(SyncSocketFD, *SyncBuffer, 2048) > 0)) {
+        static int count;
+        struct sockaddr recvaddr;
+        ssize_t rxlen;
+        char buffer[2048];  // somewhere to stash incoming UDP packets
+        socklen_t recvaddr_size = sizeof(recvaddr);
         
+        double const media_time = m_av_clock->OMXMediaTime() *1e-6;   // get the current time
+          
+        double const rnow = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now()).time_since_epoch().count() / 1000.0;
+        
+        static double ndifflast = 0;
+        static double rndifflast = 0;
+        static double rlast = 0;
+        
+        int c = 0;
+        
+        while ((rxlen = recvfrom(SyncSocketFD, static_cast<void*>(buffer), 2048, MSG_DONTWAIT, &recvaddr, &recvaddr_size)) >= 0) {
+          struct timeval tv_ioctl;
+          ioctl(SyncSocketFD, SIOCGSTAMP, &tv_ioctl);
+          std::string incoming_name;
+          double incoming_time;
+          double tnow;
+          
+          {
+            std::stringstream stream(std::string(buffer, rxlen));
+            double tdelta;
+            double rdelta = now - rlast;
+            stream >> incoming_name >> incoming_time >> tnow >> tdelta;
+            double ndiff = (now-tnow)/1000000;
+            double rndiff = (rnow-tnow/1000000);
+            
+            
+            ++c;
+            //if( (ndiff-ndifflast) > 0.030) {
+              //std::cerr << "Clocks: " << std::fixed << std::setprecision(3) << c << "\t" << ndiff << "\t" << (ndiff-ndifflast) << "\t" << rdelta << "\t" << rndiff << "\t" << (rndiff-rndifflast) << "\t" << tdelta << " " << tv_ioctl.tv_sec << ":" << tv_ioctl.tv_usec << std::endl;
+            //}
+            
+            ndifflast = ndiff;
+            rndifflast = rndiff;
+          }
+          
+          //std::cerr << "Recv: " << incoming_name << std::endl;
+          //std::cerr << "Recv: " << incoming_time << std::endl;
+        
+          //double const media_time = m_av_clock->OMXMediaTime() *1e-6;   // get the current time
+          double const sync_delta = (media_time - incoming_time);
+          
+          
+          //fixme there is already a "now" in nanoseconds
+          //double const now = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now()).time_since_epoch().count() / 1000.0;
+          double const d = incoming_time - rnow;
+          sync_history.push_front(make_pair(d,0.0));
+          if(sync_history.size() > 20) sync_history.pop_back();
+
           //! While there are packets to be received, we will keep receiving them
           //! and looking for clock data.  Any clock value we receive after another
           //! one will over-write the previous value. i.e. will keep the last one we received.
@@ -1770,90 +1906,68 @@ int main(int argc, char *argv[])
               // received_time_index = int(line.split(' ', 2)[2] * 1000000)
               // break
           
-          //! If we received an update, we now need to quickly snapshot the
-          //! difference between the recieved clock and this player, along with
-          //! when the snapeshot took place
-          // if received_time_index:
-            //! store the time we received it, based on the current player position
-            // time_of_reception = m_av_clock->OMXMediaTime()
-            //! we now store the offset between the player and the received clock,
-            //! while considering the added offset from the command line
-            // current_offset = received_time_index - time_of_reception - offset_from_command_line
-            //! positive means we're ahead, negative means we're behind
-            
-          //! if our current offset is large... say over 2 seconds, we just jump the
-          //! player to the correct position and set its playback speed to normal
-          // if abs(current_offset) > 2:
-            // if the_player_can_seek():   # m_omx_reader.CanSeek()
-              // seek_amount = -current_offset       # m_incr = 600.0;
-              // player_to_normal_speed()
-              // SyncCurSpeed = 0  # noting the above action for just below
-            //! if we can't seek, pause the player if we're ahead
-            // elif current_offset > 0:
-              // pause_the_player()
-              // SyncCurSpeed = -1   # note this as slow speed for the following process
-            //! or speed it up if we're behind
-            // else:
-              // player_to_fast_speed()
-              // SyncCurSpeed = 1
-          
-          }
-        
-        if(SyncCurSpeed != 0) {
-        //! If the current speed is not normal, then we are converging to sync.
-        //! We do this every time around the loop, even when no packets are
-        //! received.  We will dead-reckon the time that the master player should
-        //! be at.
-          
-          //! grab the player position at this moment
-          // right_now = m_av_clock->OMXMediaTime()  # the current player position
-          //! find the time past since the last "time_of_reception" (which may be dead reckoned)
-          // delta_time = right_now - time_of_reception
-          //! If the player is going fast, then the offset time will move in the positive
-          //! direction based on the delta_time, negative direction if the player is
-          //! going slower.
-          // if SyncCurSpeed == 1:
-            // current_offset += int(delta_time * (1.125 - 1))
-          //! SyncCurSpeed is -1 because it's [-1,0,1], thus can only be that at this point
-          // elif the_player_can_seek():
-            // current offset -= int(delta_time * (1 - 0.975))
-          // else:
-            // current offset -= delta_time  # player would be paused if it can't seek
-          //! Store the "time_of_reception" as being the "right_now" time because
-          //! we adjusted the "current_offset", thus dead reckoning where the master
-          //! should be right now.  It will be overwritten if we do receive a packet
-          //! next time around.
-          // time_of_reception = right_now
-          
-          //! now we need to decide if to return to normal speed
-          //! if the speed is fast, but the offset is nearly positive, then drop to normal speed
-          // if (current_offset > -0.01) and (SyncCurSpeed == 1):
-            // player_to_normal_speed()
-            // SyncCurSpeed == 0
-          //! if the speed is low (or paused) and the offset is nearly negative...
-          // if (current_offset < 0.01) and (SyncCurSpeed == -1):
-            // if the_player_can_seek():
-              // player_to_normal_speed()
-            // else:
-              // unpause_the_player()
-            // SyncCurSpeed == 0
-          
-        } else {
-        //! If the current speed is normal, then we need to decide whether to change
-        //! the speed based on the current_offset.
-          // if (current_offset < -0.05):  # will need to experiment for this threshhold
-            // player_to_fast_speed()
-            // SyncCurSpeed = 1
-          // if the_player_can_seek():
-            // if (current_offset > 0.05):
-              // player_to_slow_speed()
-              // SyncCurSpeed = -1
-          // else:
-            //! if the player cannot seek, then the only way we have to adjust it is pausing it
-            // if (current_offset > 0.2):
-              // pause_the_player()
-              // SyncCurSpeed = -1
         }
+        
+        
+        //std::cerr << "Diff: " << std::fixed << std::setprecision(3) << (now - rlast) << std::endl;
+        rlast = now;
+          
+        //Handle syncing
+        if(sync_history.size() > 0)
+        {
+          double avg_incoming_time = 0;
+          double max_incoming_time = 0;
+          for ( auto e : sync_history )
+          {
+            double const t = (rnow + e.first);
+            avg_incoming_time += t;
+            max_incoming_time = std::max(max_incoming_time, t);
+          }
+          avg_incoming_time /= sync_history.size();
+          double const avg_sync_delta = (media_time - avg_incoming_time) - SyncOffsetMilliseconds/1000;
+          
+            
+          
+          //std::cerr << "Time: " << media_time << std::endl;
+          //std::cerr << "Diff: " << sync_delta << "     speed: " << playspeed_current << " " << m_av_clock->OMXPlaySpeed() << std::endl;
+          
+          int playspeed_desired = playspeed_normal;
+          if(avg_sync_delta < -2) {
+            m_incr = -avg_sync_delta;
+          } else if(avg_sync_delta < -0.5) {
+            playspeed_desired = playspeed_ff_min + 1; //4X
+          } else if(avg_sync_delta < -0.1 && playspeed_desired != 7) {//Changing from 2X has a delay which may put us back in 2x again
+            playspeed_desired = playspeed_ff_min; //2X
+          } else if(avg_sync_delta < -0.04) {
+            playspeed_desired = 7; //1.25
+          } else if(avg_sync_delta > 5) {
+            m_incr = -avg_sync_delta;
+          } else if(avg_sync_delta > 0.5) {
+            playspeed_desired = playspeed_slow_min; //0
+          } else if(avg_sync_delta > 0.2) {
+            playspeed_desired = 4; //1/2
+          } else if(avg_sync_delta > 0.02) {
+            playspeed_desired = 5; //0.97
+          }
+          
+          if(playspeed_current != playspeed_desired) {
+            //std::cerr << "Syning Speed: " << playspeeds[playspeed_desired] << " " << playspeeds[playspeed_current] << "    diff: " << avg_sync_delta << std::endl;
+            playspeed_current = playspeed_desired;
+            SetSpeed(playspeeds[playspeed_current]);
+            //WARNING: Console log causes delay which may cause syncing to become metastable
+            //std::cerr << "Syning Speed: " << playspeeds[playspeed_desired] << " " << m_av_clock->OMXPlaySpeed() << "    diff: " << avg_sync_delta << std::endl;
+          }
+          
+          if(m_incr) {
+            std::cerr << "Syning Seek: " << m_incr  << std::endl;
+          }
+          
+          if ((count % 60) == 0) {
+            std::cout << "Jitter: " << static_cast<int>((max_incoming_time-avg_incoming_time)*2000) << "ms\tOffset: " << SyncOffsetMilliseconds/1000 << std::endl;
+            std::cerr << "Diff: " << std::fixed << std::setprecision(6) << avg_sync_delta << "\tmaster_time: " << avg_incoming_time << "\tspeed: " << m_av_clock->OMXPlaySpeed() << std::endl << std::endl;
+          }
+        }
+        ++count;
       }
 
       if(m_tv_show_info)
